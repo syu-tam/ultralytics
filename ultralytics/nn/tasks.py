@@ -511,7 +511,21 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        # Check if knowledge distillation is enabled
+        if getattr(self.args, "kd", False) and getattr(self.args, "teacher_model", None):
+            # Load teacher model
+            from ultralytics import YOLO
+            from ultralytics.utils.loss import v8DetectionCrossKDLoss
+
+            teacher = YOLO(self.args.teacher_model).model
+            teacher.to(next(self.parameters()).device)
+            teacher.eval()
+
+            # Create CrossKD loss
+            return v8DetectionCrossKDLoss(self, teacher)
+        else:
+            # Standard loss
+            return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
 
 class OBBModel(DetectionModel):
