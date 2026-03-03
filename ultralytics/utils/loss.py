@@ -182,6 +182,7 @@ class RLELoss(nn.Module):
     def forward(
         self, sigma: torch.Tensor, log_phi: torch.Tensor, error: torch.Tensor, target_weight: torch.Tensor = None
     ) -> torch.Tensor:
+        
         """
         Args:
             sigma (torch.Tensor): Output sigma, shape (N, D).
@@ -420,6 +421,7 @@ class v8DetectionLoss:
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
+        self._last_target_scores_sum = float(target_scores_sum)  # expose for CrossKD normalization
 
         # Cls loss
         loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
@@ -466,6 +468,300 @@ class v8DetectionLoss:
         batch_size = preds["boxes"].shape[0]
         loss, loss_detach = self.get_assigned_targets_and_loss(preds, batch)[1:]
         return loss * batch_size, loss_detach
+
+
+class v8DetectionCrossKDLoss(v8DetectionLoss):
+    """Criterion class for computing CrossKD training losses for YOLOv8 object detection.
+
+    Implements true Cross-Head Knowledge Distillation (CrossKD):
+      student backbone/neck → student head first layer → [channel adapt] → teacher head remaining layers
+                                                                         → cross-head predictions
+    The cross-head predictions are then distilled against the teacher's own predictions.
+    Gradient flows back through the student head's first layer, giving it a richer signal
+    from both the GT loss and the KD loss simultaneously.
+    """
+
+    def __init__(self, model, teacher_model, tal_topk: int = 10, tal_topk2: int | None = None):
+        """Initialize v8DetectionCrossKDLoss with student model, teacher model, and KD hyperparameters.
+
+        Args:
+            model: Student model (must be de-paralleled).
+            teacher_model: Teacher model for knowledge distillation.
+            tal_topk: Task-aligned assignment top-k parameter.
+            tal_topk2: Task-aligned assignment second top-k parameter.
+        """
+        super().__init__(model, tal_topk, tal_topk2)
+        self._last_target_scores_sum = 1.0  # updated each forward pass via v8DetectionLoss.loss()
+
+        # Store teacher model and extract teacher head
+        self.teacher_model = teacher_model
+        self.teacher_head = teacher_model.model[-1]  # Detect() module
+
+        # Extract KD hyperparameters
+        self.kd_temp = getattr(model.args, "kd_temperature", 4.0)
+        self.kd_weight_cls = getattr(model.args, "kd_loss_weight_cls", 1.0)
+        self.kd_weight_box = getattr(model.args, "kd_loss_weight_box", 1.0)
+        self.kd_freeze_teacher = getattr(model.args, "kd_freeze_teacher", True)
+
+        # Freeze teacher model weights
+        if self.kd_freeze_teacher:
+            for param in self.teacher_model.parameters():
+                param.requires_grad = False
+        self.teacher_model.eval()
+
+        # Store teacher dtype once to avoid repeated parameter iteration in forward
+        self._teacher_dtype = next(teacher_model.parameters()).dtype
+
+        # Validate teacher-student compatibility
+        student_head = model.model[-1]
+
+        assert self.teacher_head.nc == student_head.nc, (
+            f"Teacher nc={self.teacher_head.nc} must match student nc={student_head.nc}"
+        )
+        assert self.teacher_head.reg_max == student_head.reg_max, (
+            f"Teacher reg_max={self.teacher_head.reg_max} must match student reg_max={student_head.reg_max}"
+        )
+        assert self.teacher_head.nl == student_head.nl, (
+            f"Teacher nl={self.teacher_head.nl} must match student nl={student_head.nl}"
+        )
+
+        # Store student head reference for intermediate feature extraction in _forward_cross_head.
+        self.student_head = student_head
+
+        # True CrossKD splits each detection head's Sequential at the boundary after its first layer:
+        #
+        #   cv2[i]:  Conv(ch→c2) | Conv(c2→c2) | Conv2d(c2→4*reg_max)
+        #             ^^^student^^   ^^^^^^^^^^^^teacher remaining^^^^^^^^^^^^
+        #
+        #   cv3[i]:  Sequential(DWConv+Conv(ch→c3)) | Sequential(DWConv+Conv(c3→c3)) | Conv2d(c3→nc)
+        #             ^^^^^^^^^^^student^^^^^^^^^^^^^   ^^^^^^^^^^^^^^^^^^^^teacher remaining^^^^^^^^^^^^
+        #
+        # adapt_layers_cv2[i]: bridges c2_student → c2_teacher at the cv2 split point.
+        # adapt_layers_cv3[i]: bridges c3_student → c3_teacher at the cv3 split point.
+        self.adapt_layers_cv2 = nn.ModuleList()
+        self.adapt_layers_cv3 = nn.ModuleList()
+
+        for i in range(student_head.nl):
+            # --- cv2 (box head) ---
+            # student cv2[i][0] is Conv(ch_in, c2_s, 3); its output has c2_s channels.
+            # teacher cv2[i][1] is Conv(c2_t, c2_t, 3); its input expects c2_t channels.
+            s_c2 = student_head.cv2[i][0].conv.out_channels
+            t_c2 = self.teacher_head.cv2[i][1].conv.in_channels
+            adapt_cv2 = nn.Conv2d(s_c2, t_c2, 1, bias=False).to(self.device) if s_c2 != t_c2 else nn.Identity()
+            if isinstance(adapt_cv2, nn.Conv2d):
+                nn.init.kaiming_normal_(adapt_cv2.weight, mode="fan_out")
+            self.adapt_layers_cv2.append(adapt_cv2)
+
+            # --- cv3 (cls head) ---
+            # legacy   cv3[i][0] = Conv(ch_in, c3, 3)            → output c3 channels
+            # non-legacy cv3[i][0] = Sequential(DWConv, Conv(ch_in→c3)) → output c3 channels
+            # teacher  cv3[i][1][0] (non-legacy DWConv) or cv3[i][1] (legacy Conv) → input c3_t
+            if student_head.legacy:
+                s_c3 = student_head.cv3[i][0].conv.out_channels
+                t_c3 = self.teacher_head.cv3[i][1].conv.in_channels
+            else:
+                s_c3 = student_head.cv3[i][0][1].conv.out_channels
+                t_c3 = self.teacher_head.cv3[i][1][0].conv.in_channels
+            adapt_cv3 = nn.Conv2d(s_c3, t_c3, 1, bias=False).to(self.device) if s_c3 != t_c3 else nn.Identity()
+            if isinstance(adapt_cv3, nn.Conv2d):
+                nn.init.kaiming_normal_(adapt_cv3.weight, mode="fan_out")
+            self.adapt_layers_cv3.append(adapt_cv3)
+
+        # Register both adapt lists on the student model so the optimizer includes their parameters.
+        # build_optimizer() must be called after init_criterion() for this to take effect.
+        model.kd_adapt_layers = nn.ModuleList([*self.adapt_layers_cv2, *self.adapt_layers_cv3])
+
+    def compute_kd_loss_cls(
+        self, cross_head_scores: torch.Tensor, teacher_scores: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute classification KD loss using Quality Focal Loss (QFL).
+
+        Follows CrossKD paper's design:
+        - QFL = |teacher_sigmoid - cross_sigmoid|^beta * BCE, which focuses on positions
+          where cross-head and teacher predictions disagree.
+        - S(r)=1: all positions contribute equally to the numerator (no complex spatial
+          weighting), which is the paper's key claim.
+        - Normalized by target_scores_sum (num_pos) to match the GT classification loss
+          scale in YOLO. Using batch * num_anchors (paper's |S|) makes the loss orders of
+          magnitude smaller because (1) QFL focal weight collapses near 0 for background
+          where teacher_probs ≈ cross_probs ≈ 0 due to YOLO's bias_init, and (2) the
+          denominator would be ~500x larger than target_scores_sum.
+        - sigmoid-based (not softmax) to match YOLO's multi-label binary classification.
+
+        Args:
+            cross_head_scores: Cross-head classification predictions (student features → teacher head).
+            teacher_scores: Teacher's own classification predictions.
+
+        Returns:
+            (torch.Tensor): Weighted classification KD loss.
+        """
+        T = self.kd_temp
+        beta = 1.0  # QFL focusing parameter (same as GFL/CrossKD paper)
+
+        # Teacher sigmoid probabilities as soft targets (with temperature scaling)
+        teacher_probs = (teacher_scores / T).sigmoid().detach()
+
+        # Detached cross-head sigmoid for focal weight (no gradient through weight)
+        cross_probs = (cross_head_scores / T).sigmoid().detach()
+
+        # QFL focal weight: focus on positions where cross-head and teacher disagree
+        focal_weight = (teacher_probs - cross_probs).abs().pow(beta)
+
+        # BCE term (gradient flows through cross_head_scores here)
+        bce = F.binary_cross_entropy_with_logits(
+            cross_head_scores / T,
+            teacher_probs,
+            reduction="none",
+        )
+
+        # Normalize by target_scores_sum (num_pos) to match GT cls loss scale in YOLO.
+        # _last_target_scores_sum is updated by super().loss() before this is called.
+        kd_loss = (focal_weight * bce).sum() / self._last_target_scores_sum
+
+        # Scale by T^2 to maintain gradient magnitude
+        kd_loss = kd_loss * (T**2)
+
+        # Apply weight
+        return kd_loss * self.kd_weight_cls
+
+    def compute_kd_loss_box(
+        self, cross_head_boxes: torch.Tensor, teacher_boxes: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute bounding box KD loss via Localization Distillation (KL on DFL distributions).
+
+        Args:
+            cross_head_boxes: Cross-head box predictions in DFL format (batch, 4*reg_max, num_anchors).
+            teacher_boxes: Teacher's own box predictions in DFL format (batch, 4*reg_max, num_anchors).
+
+        Returns:
+            (torch.Tensor): Weighted box KD loss.
+        """
+        # Reshape to (batch*num_anchors*4, reg_max) to treat each coordinate as a distribution
+        cross_head_dist = cross_head_boxes.permute(0, 2, 1).reshape(-1, self.reg_max)
+        teacher_dist = teacher_boxes.permute(0, 2, 1).reshape(-1, self.reg_max)
+
+        # KL divergence between cross-head and teacher DFL distributions
+        kd_loss = F.kl_div(
+            F.log_softmax(cross_head_dist, dim=1),
+            F.softmax(teacher_dist, dim=1),
+            reduction="batchmean",
+        )
+        return kd_loss * self.kd_weight_box
+
+    def _forward_cross_head(self, student_feats: list[torch.Tensor]) -> dict[str, torch.Tensor]:
+        """True CrossKD forward pass: student head first layer → adapt → teacher head remaining layers.
+
+        Data flow per scale i:
+            student_feats[i]
+              → student cv2[i][0]       (Conv, trained)
+              → adapt_layers_cv2[i]     (1×1 conv or Identity, trained)
+              → teacher cv2[i][1]       (Conv, frozen)
+              → teacher cv2[i][2]       (Conv2d, frozen)
+              → cross box predictions
+
+            student_feats[i]
+              → student cv3[i][0]       (Sequential DWConv+Conv, trained)
+              → adapt_layers_cv3[i]     (1×1 conv or Identity, trained)
+              → teacher cv3[i][1]       (Sequential DWConv+Conv, frozen)
+              → teacher cv3[i][2]       (Conv2d, frozen)
+              → cross cls predictions
+
+        Gradient flows through the student's first layer and the adapt layer,
+        giving those weights distillation signal on top of the standard GT loss.
+
+        Args:
+            student_feats: Backbone/neck output feature maps, one tensor per detection scale.
+
+        Returns:
+            dict with 'boxes' (batch, 4*reg_max, anchors) and 'scores' (batch, nc, anchors).
+        """
+        bs = student_feats[0].shape[0]
+        cross_boxes = []
+        cross_scores = []
+
+        for i in range(self.student_head.nl):
+            feat = student_feats[i]
+
+            # --- Box head (cv2) ---
+            mid_cv2 = self.student_head.cv2[i][0](feat)                    # student layer 0 (grad ON)
+            adapt_cv2 = self.adapt_layers_cv2[i]
+            if not isinstance(adapt_cv2, nn.Identity):
+                mid_cv2 = adapt_cv2(mid_cv2.to(dtype=adapt_cv2.weight.dtype))  # adapt (grad ON)
+            mid_cv2 = mid_cv2.to(dtype=self._teacher_dtype)
+            out_cv2 = self.teacher_head.cv2[i][1](mid_cv2)                 # teacher layer 1 (frozen)
+            out_cv2 = self.teacher_head.cv2[i][2](out_cv2)                 # teacher layer 2 (frozen)
+            cross_boxes.append(out_cv2.view(bs, 4 * self.reg_max, -1))
+
+            # --- Class head (cv3) ---
+            mid_cv3 = self.student_head.cv3[i][0](feat)                    # student layer 0 (grad ON)
+            adapt_cv3 = self.adapt_layers_cv3[i]
+            if not isinstance(adapt_cv3, nn.Identity):
+                mid_cv3 = adapt_cv3(mid_cv3.to(dtype=adapt_cv3.weight.dtype))  # adapt (grad ON)
+            mid_cv3 = mid_cv3.to(dtype=self._teacher_dtype)
+            out_cv3 = self.teacher_head.cv3[i][1](mid_cv3)                 # teacher layer 1 (frozen)
+            out_cv3 = self.teacher_head.cv3[i][2](out_cv3)                 # teacher layer 2 (frozen)
+            cross_scores.append(out_cv3.view(bs, self.nc, -1))
+
+        return {
+            "boxes": torch.cat(cross_boxes, dim=-1),
+            "scores": torch.cat(cross_scores, dim=-1),
+        }
+
+    def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate combined ground-truth and knowledge distillation losses.
+
+        Args:
+            preds: Student model predictions containing 'boxes', 'scores', and 'feats'.
+            batch: Batch data containing images and ground-truth annotations.
+
+        Returns:
+            (tuple): Total loss and detached loss items for logging.
+        """
+        # 1. Compute standard ground-truth loss
+        gt_loss, gt_loss_detach = super().loss(preds, batch)
+
+        # 2. Get teacher predictions with no gradient
+        with torch.no_grad():
+            self.teacher_model.eval()  # Ensure teacher is in eval mode
+            teacher_input = batch["img"].to(dtype=self._teacher_dtype)
+            teacher_output = self.teacher_model(teacher_input)
+
+            # Extract predictions dict from output
+            if isinstance(teacher_output, tuple):
+                teacher_preds = teacher_output[1]  # (y, preds) format
+            else:
+                teacher_preds = teacher_output
+
+            # Handle end2end models
+            if isinstance(teacher_preds, dict) and "one2many" in teacher_preds:
+                teacher_preds = teacher_preds["one2many"]
+
+        # 3. True CrossKD: student feat → student head[0] → adapt → teacher head[1:] → cross predictions
+        student_feats = preds["feats"]
+        cross_head_preds = self._forward_cross_head(student_feats)
+
+        # 4. Compute KD losses
+        kd_loss_cls = self.compute_kd_loss_cls(cross_head_preds["scores"], teacher_preds["scores"])
+
+        kd_loss_box = self.compute_kd_loss_box(cross_head_preds["boxes"], teacher_preds["boxes"])
+
+        # 5. Combine losses
+        # gt_loss is a 3-element tensor [box*bs, cls*bs, dfl*bs].
+        # Appending KD losses as separate elements ensures loss.sum() counts each exactly once.
+        # KD losses are multiplied by batch_size to match the scaling of gt_loss.
+        batch_size = preds["boxes"].shape[0]
+        total_loss = torch.cat([
+            gt_loss,
+            (kd_loss_cls * batch_size).reshape(1),
+            (kd_loss_box * batch_size).reshape(1),
+        ])
+        
+        # 6. Prepare detached losses for logging (box, cls, dfl, kd_cls, kd_box)
+        total_loss_detach = torch.cat(
+            [gt_loss_detach, torch.tensor([kd_loss_cls.item(), kd_loss_box.item()], device=self.device)]
+        )
+
+        return total_loss, total_loss_detach
 
 
 class v8SegmentationLoss(v8DetectionLoss):
