@@ -167,7 +167,11 @@ class DetectionTrainer(BaseTrainer):
 
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
-        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        # Update loss names based on whether KD is enabled
+        if getattr(self.args, "kd", False):
+            self.loss_names = "box_loss", "cls_loss", "dfl_loss", "kd_cls_loss", "kd_box_loss"
+        else:
+            self.loss_names = "box_loss", "cls_loss", "dfl_loss"
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
@@ -218,6 +222,19 @@ class DetectionTrainer(BaseTrainer):
         boxes = np.concatenate([lb["bboxes"] for lb in self.train_loader.dataset.labels], 0)
         cls = np.concatenate([lb["cls"] for lb in self.train_loader.dataset.labels], 0)
         plot_labels(boxes, cls.squeeze(), names=self.data["names"], save_dir=self.save_dir, on_plot=self.on_plot)
+
+    def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
+        """Build optimizer, eagerly initializing the KD criterion first when KD is enabled.
+
+        When KD is active, the criterion creates channel-adaptation layers (adapt_layers) and
+        registers them on the student model as `kd_adapt_layers`. Doing this before the optimizer
+        is built ensures those parameters are included in the optimizer's parameter groups.
+        """
+        if getattr(self.args, "kd", False) and getattr(self.args, "teacher_model", None):
+            m = unwrap_model(model)
+            if getattr(m, "criterion", None) is None:
+                m.criterion = m.init_criterion()
+        return super().build_optimizer(model, name=name, lr=lr, momentum=momentum, decay=decay, iterations=iterations)
 
     def auto_batch(self):
         """Get optimal batch size by calculating memory occupation of model.
