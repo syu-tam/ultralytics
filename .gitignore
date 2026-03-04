@@ -204,6 +204,7 @@ calibration_*.npy
 args.yaml
 results.csv
 
+# 設定メモ
 git_manual.md
-CLAUDE.md
 docker_command.md
+CLAUDE.md
