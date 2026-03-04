@@ -133,6 +133,12 @@ kd_loss_weight_cls: 1.0 # (float) weight for classification knowledge distillati
 kd_loss_weight_box: 4.0 # (float) weight for bounding box knowledge distillation loss
 kd_temperature: 1.0 # (float) temperature for softening predictions in knowledge distillation
 kd_freeze_teacher: True # (bool) freeze teacher model weights during training
+kd_type: crosskd # (str) KD method: 'crosskd' or 'fgd'
+fgd_temp: 0.5 # (float) attention softmax temperature for FGD
+fgd_alpha: 0.001 # (float) fg_loss weight for FGD (official default)
+fgd_beta: 0.0005 # (float) bg_loss weight for FGD (official default)
+fgd_gamma: 0.0005 # (float) mask_loss weight for FGD (official default)
+fgd_lambda: 0.000005 # (float) rela_loss weight for FGD (official default)
 
 # Custom config.yaml ---------------------------------------------------------------------------------------------------
 cfg: # (str, optional) path to a config.yaml that overrides defaults
