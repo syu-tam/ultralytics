@@ -203,3 +203,8 @@ calibration_*.npy
 # Training logs
 args.yaml
 results.csv
+
+# 設定メモ
+git_manual.md
+docker_command.md
+CLAUDE.md
