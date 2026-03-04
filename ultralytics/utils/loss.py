@@ -764,6 +764,427 @@ class v8DetectionCrossKDLoss(v8DetectionLoss):
         return total_loss, total_loss_detach
 
 
+class FGDScaleLoss(nn.Module):
+    """Single-scale FGD loss module for one FPN level.
+
+    Computes four sub-losses between student and teacher feature maps:
+      - fg_loss:   MSE in foreground regions (attention-weighted)
+      - bg_loss:   MSE in background regions (attention-weighted)
+      - mask_loss: L1 distance between spatial/channel attention maps
+      - rela_loss: GCNet-style context-augmented MSE
+    """
+
+    def __init__(self, student_ch: int, teacher_ch: int, temp: float = 0.5):
+        """Initialize FGDScaleLoss.
+
+        Args:
+            student_ch: Number of student feature channels.
+            teacher_ch: Number of teacher feature channels.
+            temp: Softmax temperature for attention computation.
+        """
+        super().__init__()
+        from ultralytics.nn.modules import LayerNorm2d
+
+        self.temp = temp
+
+        # Channel alignment: project student to teacher channel count
+        self.align = (
+            nn.Conv2d(student_ch, teacher_ch, 1, bias=False)
+            if student_ch != teacher_ch
+            else nn.Identity()
+        )
+        if isinstance(self.align, nn.Conv2d):
+            nn.init.kaiming_normal_(self.align.weight, mode="fan_out")
+
+        # Spatial attention: 1×1 conv, kaiming-initialized (matches official FGD)
+        self.conv_mask_s = nn.Conv2d(teacher_ch, 1, 1)
+        self.conv_mask_t = nn.Conv2d(teacher_ch, 1, 1)
+        nn.init.kaiming_normal_(self.conv_mask_s.weight, mode="fan_in")
+        nn.init.kaiming_normal_(self.conv_mask_t.weight, mode="fan_in")
+
+        # Channel-add context branch (GCNet style), operates on teacher_ch channels
+        # Last conv is zero-initialized so the branch starts as identity (matches official FGD)
+        self.channel_add_conv_s = nn.Sequential(
+            nn.Conv2d(teacher_ch, teacher_ch // 2, 1),
+            LayerNorm2d(teacher_ch // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(teacher_ch // 2, teacher_ch, 1),
+        )
+        self.channel_add_conv_t = nn.Sequential(
+            nn.Conv2d(teacher_ch, teacher_ch // 2, 1),
+            LayerNorm2d(teacher_ch // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(teacher_ch // 2, teacher_ch, 1),
+        )
+        nn.init.zeros_(self.channel_add_conv_s[-1].weight)
+        nn.init.zeros_(self.channel_add_conv_s[-1].bias)
+        nn.init.zeros_(self.channel_add_conv_t[-1].weight)
+        nn.init.zeros_(self.channel_add_conv_t[-1].bias)
+
+    def get_attention(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute spatial and channel attention maps.
+
+        Args:
+            feat: Feature map of shape (B, C, H, W).
+
+        Returns:
+            S_attn: Spatial attention (B, 1, H, W), softmax normalized × H*W.
+            C_attn: Channel attention (B, C, 1, 1), softmax normalized × C.
+        """
+        B, C, H, W = feat.shape
+        # Spatial attention: mean over channels, then softmax
+        s = feat.abs().mean(dim=1, keepdim=True)  # (B, 1, H, W)
+        s = (s / self.temp).reshape(B, -1)         # (B, H*W)
+        s = s.softmax(dim=-1) * (H * W)            # normalize: sum = H*W
+        S_attn = s.reshape(B, 1, H, W)
+
+        # Channel attention: mean over spatial, then softmax
+        c = feat.abs().mean(dim=[2, 3], keepdim=True)  # (B, C, 1, 1)
+        c = (c / self.temp).reshape(B, -1)              # (B, C)
+        c = c.softmax(dim=-1) * C
+        C_attn = c.reshape(B, C, 1, 1)
+
+        return S_attn, C_attn
+
+    def spatial_pool(self, feat: torch.Tensor, conv_mask: nn.Module) -> torch.Tensor:
+        """GCNet-style spatial pooling to produce a context vector.
+
+        Args:
+            feat: Feature map (B, C, H, W).
+            conv_mask: 1×1 conv producing attention logits (B, 1, H, W).
+
+        Returns:
+            context: (B, C, 1, 1)
+        """
+        B, C, H, W = feat.shape
+        attn = conv_mask(feat).reshape(B, 1, H * W)  # (B, 1, H*W)
+        attn = attn.softmax(dim=-1)                   # (B, 1, H*W)
+        feat_flat = feat.reshape(B, C, H * W)         # (B, C, H*W)
+        context = torch.bmm(feat_flat, attn.transpose(1, 2))  # (B, C, 1)
+        return context.reshape(B, C, 1, 1)
+
+    def get_fea_loss(
+        self,
+        preds_S: torch.Tensor,
+        preds_T: torch.Tensor,
+        Mask_fg: torch.Tensor,
+        Mask_bg: torch.Tensor,
+        C_s: torch.Tensor,
+        C_t: torch.Tensor,
+        S_s: torch.Tensor,
+        S_t: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute foreground and background feature loss.
+
+        Args:
+            preds_S: Aligned student features (B, C_t, H, W).
+            preds_T: Teacher features (B, C_t, H, W).
+            Mask_fg: Foreground mask (B, 1, H, W).
+            Mask_bg: Background mask (B, 1, H, W).
+            C_s, C_t: Channel attention maps (B, C_t, 1, 1).
+            S_s, S_t: Spatial attention maps (B, 1, H, W).
+
+        Returns:
+            (fg_loss, bg_loss): Scalar tensors.
+        """
+        # Weight: sqrt of teacher spatial × sqrt of teacher channel attention
+        weight = S_t.sqrt() * C_t.sqrt()  # (B, C_t, H, W) broadcast
+
+        B = preds_T.shape[0]
+
+        # Foreground loss: sum / B (matches official FGD)
+        diff_fg = (preds_S - preds_T) * weight * Mask_fg.sqrt()
+        fg_loss = (diff_fg ** 2).sum() / B
+
+        # Background loss: sum / B (matches official FGD)
+        diff_bg = (preds_S - preds_T) * weight * Mask_bg.sqrt()
+        bg_loss = (diff_bg ** 2).sum() / B
+
+        return fg_loss, bg_loss
+
+    def get_mask_loss(
+        self,
+        C_s: torch.Tensor,
+        C_t: torch.Tensor,
+        S_s: torch.Tensor,
+        S_t: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute L1 attention mask distillation loss.
+
+        Args:
+            C_s, C_t: Channel attention maps (B, C_t, 1, 1).
+            S_s, S_t: Spatial attention maps (B, 1, H, W).
+
+        Returns:
+            mask_loss: Scalar tensor.
+        """
+        B = C_s.shape[0]
+        # sum / B for each term (matches official FGD: torch.sum(|diff|) / len(x))
+        return (C_s - C_t).abs().sum() / B + (S_s - S_t).abs().sum() / B
+
+    def get_rela_loss(self, preds_S: torch.Tensor, preds_T: torch.Tensor) -> torch.Tensor:
+        """Compute GCNet-style relational context loss.
+
+        Args:
+            preds_S: Aligned student features (B, C_t, H, W).
+            preds_T: Teacher features (B, C_t, H, W).
+
+        Returns:
+            rela_loss: Scalar tensor.
+        """
+        context_S = self.spatial_pool(preds_S, self.conv_mask_s)  # (B, C_t, 1, 1)
+        context_T = self.spatial_pool(preds_T, self.conv_mask_t)
+
+        aug_S = preds_S + self.channel_add_conv_s(context_S)
+        aug_T = preds_T + self.channel_add_conv_t(context_T)
+
+        B = aug_S.shape[0]
+        # sum / B (matches official FGD: MSELoss(reduction='sum') / len(out_s))
+        return ((aug_S - aug_T) ** 2).sum() / B
+
+    def forward(
+        self,
+        feat_S: torch.Tensor,
+        feat_T: torch.Tensor,
+        gt_bboxes: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute FGD sub-losses for one FPN scale.
+
+        Args:
+            feat_S: Student feature map (B, C_s, H, W).
+            feat_T: Teacher feature map (B, C_t, H, W), detached externally.
+            gt_bboxes: List of GT boxes per image in feature-map-space xyxy (list[Tensor(N,4)]).
+
+        Returns:
+            (fg_loss, bg_loss, mask_loss, rela_loss): Scalar tensors.
+        """
+        B, _, H, W = feat_T.shape
+
+        # Cast inputs to the module's parameter dtype (fp32) to avoid mixed-precision conflicts
+        module_dtype = next(self.parameters()).dtype
+        feat_S = feat_S.to(dtype=module_dtype)
+        feat_T = feat_T.to(dtype=module_dtype)
+
+        # Align student channels to teacher channels
+        preds_S = self.align(feat_S)
+        preds_T = feat_T  # already detached by caller
+
+        # Compute attention maps
+        S_s, C_s = self.get_attention(preds_S)
+        S_t, C_t = self.get_attention(preds_T)
+
+        # Build fg/bg masks from GT boxes
+        Mask_fg = torch.zeros(B, 1, H, W, device=feat_S.device, dtype=module_dtype)
+        for b in range(B):
+            boxes = gt_bboxes[b]  # (N, 4) in feat-space xyxy
+            if boxes.numel() == 0:
+                continue
+            for box in boxes:
+                x1, y1, x2, y2 = box.clamp(min=0)
+                x1i, y1i = int(x1.floor()), int(y1.floor())
+                x2i, y2i = int(x2.ceil()), int(y2.ceil())
+                x2i, y2i = min(x2i, W), min(y2i, H)
+                if x2i > x1i and y2i > y1i:
+                    area = (x2i - x1i) * (y2i - y1i)
+                    val = torch.tensor(1.0 / area, dtype=module_dtype, device=feat_S.device)
+                    Mask_fg[b, 0, y1i:y2i, x1i:x2i] = torch.maximum(
+                        Mask_fg[b, 0, y1i:y2i, x1i:x2i], val
+                    )
+
+        # Derive bg mask: strictly binary (0 where fg > 0, 1 elsewhere), then normalize
+        # by background pixel count per image — matches official FGD implementation.
+        Mask_bg = torch.zeros_like(Mask_fg)
+        for b in range(B):
+            Mask_bg[b] = torch.where(Mask_fg[b] > 0, torch.zeros_like(Mask_fg[b]), torch.ones_like(Mask_fg[b]))
+            bg_sum = Mask_bg[b].sum()
+            if bg_sum > 0:
+                Mask_bg[b] = Mask_bg[b] / bg_sum
+
+        # Compute sub-losses
+        fg_loss, bg_loss = self.get_fea_loss(preds_S, preds_T, Mask_fg, Mask_bg, C_s, C_t, S_s, S_t)
+        mask_loss = self.get_mask_loss(C_s, C_t, S_s, S_t)
+        rela_loss = self.get_rela_loss(preds_S, preds_T)
+
+        return fg_loss, bg_loss, mask_loss, rela_loss
+
+
+class v8DetectionFGDLoss(v8DetectionLoss):
+    """Criterion class for computing FGD training losses for YOLOv8 object detection.
+
+    Implements Focal and Global Knowledge Distillation (FGD):
+      Distills intermediate backbone/neck feature maps at each FPN scale using
+      foreground-focused attention and global relational context losses.
+    """
+
+    def __init__(self, model, teacher_model):
+        """Initialize v8DetectionFGDLoss.
+
+        Args:
+            model: Student model (de-paralleled).
+            teacher_model: Teacher model for KD.
+        """
+        super().__init__(model, tal_topk=10)
+
+        # Hyperparameters
+        self.fgd_temp = getattr(model.args, "fgd_temp", 0.5)
+        self.fgd_alpha = getattr(model.args, "fgd_alpha", 0.001)
+        self.fgd_beta = getattr(model.args, "fgd_beta", 0.0005)
+        self.fgd_gamma = getattr(model.args, "fgd_gamma", 0.001)
+        self.fgd_lambda = getattr(model.args, "fgd_lambda", 0.000005)
+
+        self.teacher_model = teacher_model
+        kd_freeze_teacher = getattr(model.args, "kd_freeze_teacher", True)
+        if kd_freeze_teacher:
+            for param in teacher_model.parameters():
+                param.requires_grad = False
+        self.teacher_model.eval()
+        self._teacher_dtype = next(teacher_model.parameters()).dtype
+
+        # Extract FPN channel counts from Detect head
+        student_head = model.model[-1]
+        teacher_head = teacher_model.model[-1]
+        nl = student_head.nl
+
+        student_channels = [student_head.cv2[i][0].conv.in_channels for i in range(nl)]
+        teacher_channels = [teacher_head.cv2[i][0].conv.in_channels for i in range(nl)]
+
+        # One FGDScaleLoss per FPN level — move to student device immediately (same pattern as CrossKD adapt layers)
+        self.fgd_losses = nn.ModuleList([
+            FGDScaleLoss(student_channels[i], teacher_channels[i], self.fgd_temp).to(self.device)
+            for i in range(nl)
+        ])
+
+        # Register on model so optimizer picks up fgd_losses parameters
+        model.fgd_modules = self.fgd_losses
+
+        self._nl = nl
+
+    def _make_gt_bboxes_for_scale(
+        self,
+        batch: dict,
+        feat_h: int,
+        feat_w: int,
+        img_h: int,
+        img_w: int,
+    ) -> list[torch.Tensor]:
+        """Convert batch GT boxes to feature-map-space xyxy per image.
+
+        Args:
+            batch: Training batch dict with 'bboxes' (normalized xywh) and 'batch_idx'.
+            feat_h, feat_w: Feature map spatial dimensions.
+            img_h, img_w: Input image spatial dimensions.
+
+        Returns:
+            List of length B, each element Tensor(N_i, 4) in feat-space xyxy.
+        """
+        bboxes_norm = batch["bboxes"]  # (total_instances, 4) normalized xywh
+        batch_idx = batch["batch_idx"].long()
+        B = int(batch_idx.max().item()) + 1 if batch_idx.numel() > 0 else batch["img"].shape[0]
+
+        # Convert normalized xywh → pixel xyxy in feature-map space
+        scale_x = feat_w / img_w
+        scale_y = feat_h / img_h
+
+        cx = bboxes_norm[:, 0] * img_w * scale_x
+        cy = bboxes_norm[:, 1] * img_h * scale_y
+        bw = bboxes_norm[:, 2] * img_w * scale_x
+        bh = bboxes_norm[:, 3] * img_h * scale_y
+
+        x1 = cx - bw / 2
+        y1 = cy - bh / 2
+        x2 = cx + bw / 2
+        y2 = cy + bh / 2
+
+        boxes_feat = torch.stack([x1, y1, x2, y2], dim=1)  # (total, 4)
+
+        result = []
+        for b in range(B):
+            mask = batch_idx == b
+            result.append(boxes_feat[mask])
+        return result
+
+    def loss(
+        self, preds: dict, batch: dict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute combined GT + FGD losses.
+
+        Args:
+            preds: Student predictions dict with 'feats' key.
+            batch: Training batch dict.
+
+        Returns:
+            (total_loss, total_loss_detach): 7-element tensors.
+        """
+        # 1. Standard GT loss
+        gt_loss, gt_loss_detach = super().loss(preds, batch)
+
+        # 2. Teacher forward (no grad)
+        with torch.no_grad():
+            self.teacher_model.eval()
+            teacher_output = self.teacher_model(batch["img"].to(dtype=self._teacher_dtype))
+            if isinstance(teacher_output, tuple):
+                teacher_preds = teacher_output[1]
+            else:
+                teacher_preds = teacher_output
+            if isinstance(teacher_preds, dict) and "one2many" in teacher_preds:
+                teacher_preds = teacher_preds["one2many"]
+            teacher_feats = teacher_preds["feats"]
+
+        # 3. Student FPN features
+        student_feats = preds["feats"]
+        
+
+        img_h, img_w = batch["img"].shape[2], batch["img"].shape[3]
+        batch_size = batch["img"].shape[0]
+
+        # 4. Per-scale FGD losses
+        total_fg = torch.zeros(1, device=self.device)
+        total_bg = torch.zeros(1, device=self.device)
+        total_mask = torch.zeros(1, device=self.device)
+        total_rela = torch.zeros(1, device=self.device)
+
+        for i in range(self._nl):
+            s_feat = student_feats[i]
+            t_feat = teacher_feats[i].detach().to(dtype=s_feat.dtype)
+
+            assert s_feat.shape[2:] == t_feat.shape[2:], (
+                f"FGD scale {i}: student spatial {s_feat.shape[2:]} != teacher {t_feat.shape[2:]}"
+            )
+
+            feat_h, feat_w = s_feat.shape[2], s_feat.shape[3]
+            gt_bboxes = self._make_gt_bboxes_for_scale(batch, feat_h, feat_w, img_h, img_w)
+
+            fg, bg, mask, rela = self.fgd_losses[i](s_feat, t_feat, gt_bboxes)
+            total_fg = total_fg + fg
+            total_bg = total_bg + bg
+            total_mask = total_mask + mask
+            total_rela = total_rela + rela
+
+        # Apply weights and scale by batch_size (match GT loss scaling convention)
+        # Scales are summed (not averaged) to match official FGD hook behaviour.
+        fg_loss = self.fgd_alpha * total_fg * batch_size
+        bg_loss = self.fgd_beta * total_bg * batch_size
+        mask_loss = self.fgd_gamma * total_mask * batch_size
+        rela_loss = self.fgd_lambda * total_rela * batch_size
+
+        # 5. Combine [box, cls, dfl, fgd_fg, fgd_bg, fgd_mask, fgd_rela]
+        total_loss = torch.cat([
+            gt_loss,
+            fg_loss.reshape(1),
+            bg_loss.reshape(1),
+            mask_loss.reshape(1),
+            rela_loss.reshape(1),
+        ])
+
+        # Display weighted per-sample values (consistent with GT loss scale).
+        total_loss_detach = torch.cat([
+            gt_loss_detach,
+            torch.cat([fg_loss, bg_loss, mask_loss, rela_loss]).detach() / batch_size,
+        ])
+
+        return total_loss, total_loss_detach
+
+
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
 
