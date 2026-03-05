@@ -208,3 +208,4 @@ results.csv
 git_manual.md
 docker_command.md
 CLAUDE.md
+train_kd.py
