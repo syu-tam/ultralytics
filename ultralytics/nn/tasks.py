@@ -45,6 +45,7 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
+    DetectSelfDistill,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -405,6 +406,8 @@ class DetectionModel(BaseModel):
                 output = self.forward(x)
                 if self.end2end:
                     output = output["one2many"]
+                if isinstance(output, dict) and "main" in output:  # DetectSelfDistill format
+                    return output["main"]["feats"]
                 return output["feats"]
 
             self.model.eval()  # Avoid changing batch statistics until training begins
@@ -511,6 +514,11 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
+        # Self-distillation: no external teacher needed
+        if getattr(self.model[-1], "self_distill", False):
+            from ultralytics.utils.loss import v8DetectionSelfDistillLoss
+
+            return v8DetectionSelfDistillLoss(self)
         # Check if knowledge distillation is enabled
         if getattr(self.args, "kd", False) and getattr(self.args, "teacher_model", None):
 <<<<<<< HEAD
@@ -530,6 +538,7 @@ class DetectionModel(BaseModel):
             return v8DetectionCrossKDLoss(self, teacher)
 =======
             kd_type = getattr(self.args, "kd_type", "crosskd").lower()
+
             if kd_type == "fgd":
                 from ultralytics.utils.loss import v8DetectionFGDLoss
 
@@ -1711,6 +1720,7 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset(
             {
                 Detect,
+                DetectSelfDistill,
                 WorldDetect,
                 YOLOEDetect,
                 Segment,
@@ -1723,6 +1733,8 @@ def parse_model(d, ch, verbose=True):
                 OBB26,
             }
         ):
+            if m is DetectSelfDistill and (len(args) < 2 or not isinstance(args[1], str)):
+                args.insert(1, "pan")  # default aux_neck
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)

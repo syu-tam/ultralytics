@@ -128,17 +128,26 @@ erasing: 0.4 # (float) random erasing probability for classification (0.0–1.0)
 
 # Knowledge Distillation settings --------------------------------------------------------------------------------------
 kd: False # (bool) enable knowledge distillation training
-teacher_model: # (str, optional) path to teacher model file for knowledge distillation, e.g. 'yolov8l.pt'
-kd_loss_weight_cls: 1.0 # (float) weight for classification knowledge distillation loss
-kd_loss_weight_box: 4.0 # (float) weight for bounding box knowledge distillation loss
-kd_temperature: 1.0 # (float) temperature for softening predictions in knowledge distillation
+teacher_model: # (str, optional) path to teacher model file, e.g. 'yolo11l.pt'
 kd_freeze_teacher: True # (bool) freeze teacher model weights during training
 kd_type: crosskd # (str) KD method: 'crosskd' or 'fgd'
-fgd_temp: 0.5 # (float) attention softmax temperature for FGD
-fgd_alpha: 0.001 # (float) fg_loss weight for FGD (official default)
-fgd_beta: 0.0005 # (float) bg_loss weight for FGD (official default)
-fgd_gamma: 0.0005 # (float) mask_loss weight for FGD (official default)
-fgd_lambda: 0.000005 # (float) rela_loss weight for FGD (official default)
+
+# CrossKD hyperparameters
+kd_loss_weight_cls: 1.0 # (float) cls KD loss weight
+kd_loss_weight_box: 4.0 # (float) box KD loss weight
+kd_temperature: 4.0 # (float) softening temperature
+
+# FGD hyperparameters
+fgd_temp: 0.5 # (float) attention softmax temperature
+fgd_alpha: 0.001 # (float) fg_loss weight
+fgd_beta: 0.0005 # (float) bg_loss weight
+fgd_gamma: 0.001 # (float) mask_loss weight
+fgd_lambda: 0.000005 # (float) rela_loss weight
+
+# Self-Distillation hyperparameters
+sd_temp_cls: 3.0 # (float) cls KL distillation temperature
+sd_temp_dfl: 3.0 # (float) DFL KL distillation temperature
+sd_kd_weight: 1.0 # (float) distillation loss weight
 
 # Custom config.yaml ---------------------------------------------------------------------------------------------------
 cfg: # (str, optional) path to a config.yaml that overrides defaults
