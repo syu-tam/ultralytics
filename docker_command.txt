@@ -1,1 +1,0 @@
-docker run -it --gpus all --ipc=host --name yolo-dev -v $(pwd):/workspace/ultralytics -v ~/tamura/object_detection/v11/datasets:/workspace/datasets yolo-research bash
