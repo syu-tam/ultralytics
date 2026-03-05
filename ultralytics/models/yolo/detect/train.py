@@ -167,8 +167,10 @@ class DetectionTrainer(BaseTrainer):
 
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
-        # Update loss names based on whether KD is enabled and which method
-        if getattr(self.args, "kd", False):
+        # Update loss names based on head type and KD method
+        if getattr(self.model.model[-1], "self_distill", False):
+            self.loss_names = "box_loss", "cls_loss", "dfl_loss", "sd_loss"
+        elif getattr(self.args, "kd", False):
             kd_type = getattr(self.args, "kd_type", "crosskd").lower()
             if kd_type == "fgd":
                 self.loss_names = (

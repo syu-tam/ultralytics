@@ -251,6 +251,100 @@ class Detect(nn.Module):
         self.cv2 = self.cv3 = None
 
 
+class DetectSelfDistill(Detect):
+    """Self-distillation detection head.
+
+    Uses a lightweight auxiliary neck built from pre-PAN (backbone) features to produce
+    auxiliary predictions that are distilled toward the main head's predictions via KL
+    divergence on cls/DFL distributions (fg anchors only). No external teacher is needed.
+
+    Args:
+        nc (int): Number of classes.
+        aux_neck (str): Auxiliary neck type — "pan" (FPN top-down + PAN bottom-up),
+            "fpn" (FPN top-down only, lighter), or "bifpn" (BiFPN: PAN + extra P4
+            skip from backbone, same as YOLOv5 BiFPN head).
+        reg_max (int): DFL channels.
+        ch (tuple): Channel sizes — first nl are pre-PAN (backbone), last nl are post-PAN.
+    """
+
+    self_distill = True  # routing flag for init_criterion()
+
+    def __init__(self, nc: int = 80, aux_neck: str = "pan", reg_max: int = 16, end2end: bool = False, ch: tuple = ()):
+        """Initialize DetectSelfDistill with pre-PAN and post-PAN channels."""
+        nl = len(ch) // 2
+        pre_ch = list(ch[:nl])   # backbone channels: [c3, c4, c5]
+        post_ch = list(ch[nl:])  # post-PAN channels: [d3, d4, d5]
+        super().__init__(nc=nc, reg_max=reg_max, ch=post_ch)  # main head: cv2/cv3 (end2end not used)
+
+        self.aux_neck = aux_neck
+
+        # Auxiliary detection layers — same structure as main head (post_ch matches aux neck output)
+        self.aux_cv2 = copy.deepcopy(self.cv2)
+        self.aux_cv3 = copy.deepcopy(self.cv3)
+
+        # Top-down FPN (shared by both "fpn" and "pan")
+        c3, c4, c5 = pre_ch
+        self.aux_fpn_p4 = nn.Sequential(DWConv(c4 + c5, c4 + c5, 3), Conv(c4 + c5, c4, 1))
+        self.aux_fpn_p3 = nn.Sequential(DWConv(c3 + c4, c3 + c4, 3), Conv(c3 + c4, c3 // 2, 1))
+
+        if aux_neck == "pan":
+            # Bottom-up PAN
+            self.aux_pan_down_p3 = DWConv(c3 // 2, c3 // 2, 3, 2)
+            self.aux_pan_p4 = nn.Sequential(DWConv(c4 + c3 // 2, c4 + c3 // 2, 3), Conv(c4 + c3 // 2, c4, 1))
+            self.aux_pan_down_p4 = DWConv(c4, c4, 3, 2)
+            self.aux_pan_p5 = nn.Sequential(DWConv(c5 + c4, c5 + c4, 3), Conv(c5 + c4, c5, 1))
+        elif aux_neck == "bifpn":
+            # Bottom-up BiFPN: P4 fuses down(P3_fpn) + P4_fpn + P4_backbone (extra skip)
+            self.aux_pan_down_p3 = DWConv(c3 // 2, c3 // 2, 3, 2)
+            self.aux_bifpn_p4 = nn.Sequential(
+                DWConv(2 * c4 + c3 // 2, 2 * c4 + c3 // 2, 3), Conv(2 * c4 + c3 // 2, c4, 1)
+            )
+            self.aux_pan_down_p4 = DWConv(c4, c4, 3, 2)
+            self.aux_pan_p5 = nn.Sequential(DWConv(c5 + c4, c5 + c4, 3), Conv(c5 + c4, c5, 1))
+
+    def _aux_neck_forward(self, pre_feats: list) -> list:
+        """Run auxiliary neck: FPN top-down (+ PAN / BiFPN bottom-up if aux_neck != 'fpn')."""
+        p3, p4, p5 = pre_feats
+        # Top-down FPN
+        p4_fpn = self.aux_fpn_p4(torch.cat([p4, F.interpolate(p5, size=p4.shape[-2:], mode="nearest")], 1))
+        p3_fpn = self.aux_fpn_p3(torch.cat([p3, F.interpolate(p4_fpn, size=p3.shape[-2:], mode="nearest")], 1))
+        if self.aux_neck == "pan":
+            # Bottom-up PAN
+            p4_pan = self.aux_pan_p4(torch.cat([p4_fpn, self.aux_pan_down_p3(p3_fpn)], 1))
+            p5_pan = self.aux_pan_p5(torch.cat([p5, self.aux_pan_down_p4(p4_pan)], 1))
+            return [p3_fpn, p4_pan, p5_pan]
+        if self.aux_neck == "bifpn":
+            # Bottom-up BiFPN: P4 also takes the original backbone P4 as skip connection
+            p4_bifpn = self.aux_bifpn_p4(torch.cat([p4_fpn, self.aux_pan_down_p3(p3_fpn), p4], 1))
+            p5_bifpn = self.aux_pan_p5(torch.cat([p5, self.aux_pan_down_p4(p4_bifpn)], 1))
+            return [p3_fpn, p4_bifpn, p5_bifpn]
+        # FPN only: p5 passthrough (channels already match post_ch[2])
+        return [p3_fpn, p4_fpn, p5]
+
+    def forward(self, x: list) -> dict | torch.Tensor | tuple:
+        """Forward pass: main head always runs; aux head runs only during training."""
+        nl = self.nl
+        pre_feats = list(x[:nl])   # pre-PAN backbone features
+        post_pan = list(x[nl:])    # post-PAN neck features
+        main_preds = self.forward_head(post_pan, box_head=self.cv2, cls_head=self.cv3)
+
+        if self.training:
+            aux_feats = self._aux_neck_forward(pre_feats)
+            aux_preds = self.forward_head(aux_feats, box_head=self.aux_cv2, cls_head=self.aux_cv3)
+            return {"main": main_preds, "aux": aux_preds}
+
+        # Inference: main head only (Detect-compatible)
+        y = self._inference(main_preds)
+        return y if self.export else (y, main_preds)
+
+    def bias_init(self) -> None:
+        """Initialize biases for both main and auxiliary heads."""
+        super().bias_init()  # main head (cv2/cv3)
+        for i, (a, b) in enumerate(zip(self.aux_cv2, self.aux_cv3)):
+            a[-1].bias.data[:] = 1.0
+            b[-1].bias.data[: self.nc] = math.log(5 / self.nc / (640 / self.stride[i]) ** 2)
+
+
 class Segment(Detect):
     """YOLO Segment head for segmentation models.
 

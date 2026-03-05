@@ -422,6 +422,7 @@ class v8DetectionLoss:
 
         target_scores_sum = max(target_scores.sum(), 1)
         self._last_target_scores_sum = float(target_scores_sum)  # expose for CrossKD normalization
+        self._last_target_scores = target_scores  # expose for self-distillation weighting
 
         # Cls loss
         loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
@@ -497,11 +498,11 @@ class v8DetectionCrossKDLoss(v8DetectionLoss):
         self.teacher_model = teacher_model
         self.teacher_head = teacher_model.model[-1]  # Detect() module
 
-        # Extract KD hyperparameters
-        self.kd_temp = getattr(model.args, "kd_temperature", 4.0)
-        self.kd_weight_cls = getattr(model.args, "kd_loss_weight_cls", 1.0)
-        self.kd_weight_box = getattr(model.args, "kd_loss_weight_box", 1.0)
-        self.kd_freeze_teacher = getattr(model.args, "kd_freeze_teacher", True)
+        # Extract KD hyperparameters (defaults injected by init_criterion via KD_DEFAULTS)
+        self.kd_temp = model.args.kd_temperature
+        self.kd_weight_cls = model.args.kd_loss_weight_cls
+        self.kd_weight_box = model.args.kd_loss_weight_box
+        self.kd_freeze_teacher = model.args.kd_freeze_teacher
 
         # Freeze teacher model weights
         if self.kd_freeze_teacher:
@@ -1025,16 +1026,15 @@ class v8DetectionFGDLoss(v8DetectionLoss):
         """
         super().__init__(model, tal_topk=10)
 
-        # Hyperparameters
-        self.fgd_temp = getattr(model.args, "fgd_temp", 0.5)
-        self.fgd_alpha = getattr(model.args, "fgd_alpha", 0.001)
-        self.fgd_beta = getattr(model.args, "fgd_beta", 0.0005)
-        self.fgd_gamma = getattr(model.args, "fgd_gamma", 0.001)
-        self.fgd_lambda = getattr(model.args, "fgd_lambda", 0.000005)
+        # Hyperparameters (defaults injected by init_criterion via KD_DEFAULTS)
+        self.fgd_temp = model.args.fgd_temp
+        self.fgd_alpha = model.args.fgd_alpha
+        self.fgd_beta = model.args.fgd_beta
+        self.fgd_gamma = model.args.fgd_gamma
+        self.fgd_lambda = model.args.fgd_lambda
 
         self.teacher_model = teacher_model
-        kd_freeze_teacher = getattr(model.args, "kd_freeze_teacher", True)
-        if kd_freeze_teacher:
+        if model.args.kd_freeze_teacher:
             for param in teacher_model.parameters():
                 param.requires_grad = False
         self.teacher_model.eval()
@@ -1080,6 +1080,7 @@ class v8DetectionFGDLoss(v8DetectionLoss):
         bboxes_norm = batch["bboxes"]  # (total_instances, 4) normalized xywh
         batch_idx = batch["batch_idx"].long()
         B = int(batch_idx.max().item()) + 1 if batch_idx.numel() > 0 else batch["img"].shape[0]
+        B = batch["img"].shape[0]
 
         # Convert normalized xywh → pixel xyxy in feature-map space
         scale_x = feat_w / img_w
@@ -1160,29 +1161,118 @@ class v8DetectionFGDLoss(v8DetectionLoss):
             total_mask = total_mask + mask
             total_rela = total_rela + rela
 
-        # Apply weights and scale by batch_size (match GT loss scaling convention)
-        # Scales are summed (not averaged) to match official FGD hook behaviour.
-        fg_loss = self.fgd_alpha * total_fg * batch_size
-        bg_loss = self.fgd_beta * total_bg * batch_size
-        mask_loss = self.fgd_gamma * total_mask * batch_size
-        rela_loss = self.fgd_lambda * total_rela * batch_size
+        fg_loss   = self.fgd_alpha * total_fg
+        bg_loss   = self.fgd_beta  * total_bg
+        mask_loss = self.fgd_gamma * total_mask
+        rela_loss = self.fgd_lambda * total_rela
 
         # 5. Combine [box, cls, dfl, fgd_fg, fgd_bg, fgd_mask, fgd_rela]
         total_loss = torch.cat([
             gt_loss,
-            fg_loss.reshape(1),
-            bg_loss.reshape(1),
-            mask_loss.reshape(1),
-            rela_loss.reshape(1),
+            (fg_loss   * batch_size).reshape(1),
+            (bg_loss   * batch_size).reshape(1),
+            (mask_loss * batch_size).reshape(1),
+            (rela_loss * batch_size).reshape(1),
         ])
 
-        # Display weighted per-sample values (consistent with GT loss scale).
         total_loss_detach = torch.cat([
             gt_loss_detach,
-            torch.cat([fg_loss, bg_loss, mask_loss, rela_loss]).detach() / batch_size,
+            torch.cat([fg_loss, bg_loss, mask_loss, rela_loss]).detach(),
         ])
 
         return total_loss, total_loss_detach
+
+
+class v8DetectionSelfDistillLoss(v8DetectionLoss):
+    """Self-distillation loss for DetectSelfDistill head.
+
+    The model produces {"main": preds, "aux": preds} during training. GT loss is computed
+    on the main head only. KL divergence (cls + DFL) from main → aux is applied at fg anchors.
+    No external teacher model is required.
+    """
+
+    def __init__(self, model):
+        """Initialize v8DetectionSelfDistillLoss with self-distillation hyperparameters."""
+        super().__init__(model)
+        h = model.args
+        self.sd_temp_cls = h.sd_temp_cls
+        self.sd_temp_dfl = h.sd_temp_dfl
+        self.sd_kd_weight = h.sd_kd_weight
+
+    def loss(self, preds: dict, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute GT loss on main head and KL distillation loss (main → aux) at fg anchors."""
+        # During validation the head returns (y, main_preds); parse_output gives main_preds directly.
+        if "main" not in preds:
+            batch_size = preds["boxes"].shape[0]
+            loss, loss_detach = self.get_assigned_targets_and_loss(preds, batch)[1:]
+            zero = torch.zeros(1, device=self.device)
+            return torch.cat([loss * batch_size, zero]), torch.cat([loss_detach, zero])
+        main_preds = preds["main"]
+        aux_preds = preds["aux"]
+        batch_size = main_preds["boxes"].shape[0]
+
+        # GT loss computed on main head; fg_mask used for distillation
+        (fg_mask, *_), main_loss, main_detach = self.get_assigned_targets_and_loss(main_preds, batch)
+        target_scores = self._last_target_scores
+
+        # KL distillation: main (detached teacher) → aux (student)
+        kd_loss = self._kl_distill(main_preds, aux_preds, fg_mask, target_scores)
+
+        total_loss = torch.cat([
+            main_loss * batch_size,
+            (kd_loss * self.sd_kd_weight * batch_size).reshape(1),
+        ])
+        loss_items = torch.cat([
+            main_detach, 
+            torch.tensor([kd_loss.item() * self.sd_kd_weight], device=self.device)])
+        return total_loss, loss_items
+
+    def _kl_distill(
+        self,
+        main_preds: dict,
+        aux_preds: dict,
+        fg_mask: torch.Tensor,
+        target_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute KL divergence on cls/DFL distributions at fg anchors only.
+
+        Each fg anchor is weighted by target_scores.sum(-1), consistent with GT loss normalization.
+
+        Args:
+            main_preds: Main head predictions dict with 'scores' and 'boxes'.
+            aux_preds: Auxiliary head predictions dict with 'scores' and 'boxes'.
+            fg_mask: Boolean mask (B, A) of foreground anchor positions.
+            target_scores: Soft assignment scores (B, A, nc) from TaskAlignedAssigner.
+
+        Returns:
+            (torch.Tensor): Scalar KL distillation loss.
+        """
+        T_cls, T_dfl = self.sd_temp_cls, self.sd_temp_dfl
+        fg_flat = fg_mask.view(-1)
+        
+
+        # per-anchor weight = sum of target class scores (same as GT loss normalization)
+        base_weight = target_scores.sum(-1).view(-1)[fg_flat]  # (N_fg,)
+        weight_sum = base_weight.sum().clamp(min=1)
+
+        # cls: (B, nc, A) → (B*A, nc) → fg only
+        main_cls = main_preds["scores"].permute(0, 2, 1).flatten(0, 1)[fg_flat]
+        aux_cls = aux_preds["scores"].permute(0, 2, 1).flatten(0, 1)[fg_flat]
+
+        p_t_cls = F.softmax(main_cls.detach() / T_cls, dim=1)
+        log_q_cls = F.log_softmax(aux_cls / T_cls, dim=1)
+        cls_per = -(p_t_cls * log_q_cls).sum(dim=1)  # (N_fg,)
+        kl_cls = (base_weight * cls_per).sum() / weight_sum
+
+        # DFL: (B, 4*reg_max, A) → fg only → (N_fg, 4, reg_max)
+        main_dfl = main_preds["boxes"].permute(0, 2, 1).flatten(0, 1)[fg_flat].view(-1, 4, self.reg_max)
+        aux_dfl = aux_preds["boxes"].permute(0, 2, 1).flatten(0, 1)[fg_flat].view(-1, 4, self.reg_max)
+        p_t_dfl = F.softmax(main_dfl.detach() / T_dfl, dim=2)
+        log_q_dfl = F.log_softmax(aux_dfl / T_dfl, dim=2)
+        dfl_per = -(p_t_dfl * log_q_dfl).sum(dim=2).mean(dim=1)  # (N_fg,): sum over reg_max, mean over 4 dirs
+        kl_dfl = (base_weight * dfl_per).sum() / weight_sum
+
+        return kl_cls + kl_dfl
 
 
 class v8SegmentationLoss(v8DetectionLoss):
