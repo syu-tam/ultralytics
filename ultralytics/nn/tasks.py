@@ -251,6 +251,8 @@ class BaseModel(torch.nn.Module):
                     m.forward = m.forward_fuse
                 if isinstance(m, Detect) and getattr(m, "end2end", False):
                     m.fuse()  # remove one2many head
+                if isinstance(m, DetectSelfDistill):
+                    m.fuse()  # remove auxiliary head/neck for inference
             self.info(verbose=verbose)
 
         return self

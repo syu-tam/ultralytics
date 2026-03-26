@@ -333,9 +333,20 @@ class DetectSelfDistill(Detect):
             aux_preds = self.forward_head(aux_feats, box_head=self.aux_cv2, cls_head=self.aux_cv3)
             return {"main": main_preds, "aux": aux_preds}
 
+
         # Inference: main head only (Detect-compatible)
         y = self._inference(main_preds)
         return y if self.export else (y, main_preds)
+
+    def fuse(self) -> None:
+        """Remove auxiliary head and neck for inference to reduce memory usage."""
+        for attr in (
+            "aux_cv2", "aux_cv3", "aux_fpn_p4", "aux_fpn_p3",
+            "aux_pan_down_p3", "aux_pan_p4", "aux_pan_down_p4", "aux_pan_p5",
+            "aux_bifpn_p4",
+        ):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
 
     def bias_init(self) -> None:
         """Initialize biases for both main and auxiliary heads."""
